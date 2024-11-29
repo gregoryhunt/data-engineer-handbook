@@ -136,3 +136,6 @@ dump.sql
 
 postgres-data/*
 homework/your_username
+
+# Ignore all .zip file's
+*.zip
