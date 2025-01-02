@@ -1,22 +1,20 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import broadcast, lit, col, avg, count, desc, sum
+from pyspark.sql.functions import broadcast, col, avg, count, desc, sum
 
 spark = SparkSession.builder.appName("homework_3").getOrCreate()
-
-match_details_df = spark.read.option("header", "true") \
-    .option("inferSchema", "true") \
-    .csv("/home/iceberg/data/match_details.csv") \
-    .repartitionByRange(16, "match_id")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
 
 matches_df = spark.read.option("header", "true") \
     .option("inferSchema", "true") \
-    .csv("/home/iceberg/data/matches.csv") \
-    .repartitionByRange(16, "match_id")
+    .csv("/home/iceberg/data/matches.csv")
+
+match_details_df = spark.read.option("header", "true") \
+    .option("inferSchema", "true") \
+    .csv("/home/iceberg/data/match_details.csv")
 
 medals_matches_players_df = spark.read.option("header", "true") \
     .option("inferSchema", "true") \
-    .csv("/home/iceberg/data/medals_matches_players.csv") \
-    .repartitionByRange(16, "match_id")
+    .csv("/home/iceberg/data/medals_matches_players.csv")
 
 # Broadcast smaller tables
 medals_df = broadcast(spark.read.option("header", "true") \
@@ -27,77 +25,227 @@ maps_df = broadcast(spark.read.option("header", "true") \
     .option("inferSchema", "true") \
     .csv("/home/iceberg/data/maps.csv"))
 
-joined_df = match_details_df \
-    .join(matches_df, "match_id") \
-    .join(medals_matches_players_df, ["match_id", "player_gamertag"]) \
-    .join(medals_df.select(
-        col("medal_id"),
-        col("name").alias("medal_name"),
-        col("description").alias("medal_description")
-    ), "medal_id") \
-    .join(maps_df.select(
-        col("mapid"),
-        col("name").alias("map_name"),
-        col("description").alias("map_description")
-    ), matches_df.mapid == maps_df.mapid) \
-    .drop(maps_df.mapid)
+spark.sql("""DROP TABLE IF EXISTS homework_3.matches""")
+matches_ddl = """
+CREATE TABLE homework_3.matches (
+    match_id STRING,
+    mapid STRING,
+    is_team_game BOOLEAN,
+    playlist_id STRING,
+    completion_date TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (bucket(16, match_id))
+"""
+spark.sql(matches_ddl)
+matches_df \
+    .select("match_id", "mapid", "is_team_game", "playlist_id", "completion_date") \
+    .write.mode("append") \
+    .bucketBy(16, "match_id").saveAsTable("homework_3.matches")
+    
 
-avg_kills = match_details_df \
+spark.sql("""DROP TABLE IF EXISTS homework_3.match_details""")
+match_details_ddl = """
+CREATE TABLE IF NOT EXISTS homework_3.match_details (
+    match_id STRING,
+    player_gamertag STRING,
+    player_total_kills INTEGER,
+    player_total_deaths INTEGER
+)
+USING iceberg
+PARTITIONED BY (bucket(16, match_id));
+"""
+spark.sql(match_details_ddl)
+match_details_df \
+    .select("match_id", "player_gamertag", "player_total_kills", "player_total_deaths") \
+    .write.mode("append") \
+    .bucketBy(16, "match_id").saveAsTable("homework_3.match_details")
+    
+
+
+spark.sql("""DROP TABLE IF EXISTS homework_3.medal_matches_players""")
+medal_matches_players_ddl = """
+CREATE TABLE homework_3.medal_matches_players (
+    match_id STRING,
+    player_gamertag STRING,
+    medal_id LONG,
+    count INT
+)
+USING iceberg
+PARTITIONED BY (bucket(16, match_id))
+"""
+spark.sql(medal_matches_players_ddl)
+medals_matches_players_df \
+    .select("match_id", "player_gamertag", "medal_id", "count") \
+    .write.mode("append") \
+    .bucketBy(16, "match_id").saveAsTable("homework_3.medals_matches_players")
+
+# Join tables
+joined_match_df = spark.table("homework_3.matches").alias("m") \
+    .join(spark.table("homework_3.match_details").alias("md"), col("m.match_id") == col("md.match_id"), "left") \
+    .join(spark.table("homework_3.medals_matches_players").alias("mmp"), (col("md.match_id") == col("mmp.match_id")) & (col("md.player_gamertag") == col("mmp.player_gamertag")), "left") \
+    .join(broadcast(maps_df).alias("maps"), col("m.mapid") == col("maps.mapid"), "left") \
+    .join(broadcast(medals_df).alias("medals").select("medals.medal_id", "medals.name"), col("mmp.medal_id") == col("medals.medal_id"), "left")
+
+
+avg_kills = joined_match_df \
+    .select("m.match_id", "md.player_gamertag", "md.player_total_kills").distinct() \
     .groupBy("player_gamertag") \
     .agg(
         avg("player_total_kills").alias("avg_kills"),
         count("match_id").alias("total_matches")
     ) \
     .orderBy(desc("avg_kills"))
-avg_kills.show(5)
+avg_kills.take(5)
 
-playlist_counts = matches_df \
+playlist_counts = joined_match_df \
+    .select("m.match_id", "m.playlist_id").distinct() \
     .groupBy("playlist_id") \
     .count() \
     .orderBy(desc("count"))
 
-playlist_counts.show(5)
+playlist_counts.take(5)
 
-map_counts = matches_df \
-    .join(maps_df, "mapid") \
+map_counts = joined_match_df \
+    .select("m.match_id", "maps.name").distinct() \
     .groupBy("name") \
     .count() \
     .orderBy(desc("count"))
 
-map_counts.show(5)
+map_counts.take(5)
 
-killing_spree_by_map = joined_df \
-    .filter(col("medal_name") == "Killing Spree") \
-    .groupBy("map_name") \
-    .agg(sum("count").alias("spree_count")) \
+killing_spree_by_map = joined_match_df \
+    .filter(col("medals.name") == "Killing Spree") \
+    .groupBy("maps.name") \
+    .agg(sum("mmp.count").alias("spree_count")) \
     .orderBy(desc("spree_count"))
 
-killing_spree_by_map.show(5)
-
-unsorted_df = joined_df.repartition(16, matches_df.mapid)
-unsorted_df.write.mode("overwrite").saveAsTable("hw3.unsorted")
-
-sorted_by_playlist = joined_df \
-    .sortWithinPartitions(matches_df.playlist_id)
-sorted_by_playlist.write.mode("overwrite").saveAsTable("hw3.sorted_by_playlist")
-
-sorted_by_map = joined_df \
-    .sortWithinPartitions(matches_df.mapid)
-sorted_by_map.write.mode("overwrite").saveAsTable("hw3.sorted_by_map")
+killing_spree_by_map.take(5)
 
 spark.sql("""
-    SELECT SUM(file_size_in_bytes) as size, 
-           COUNT(1) as num_files, 
-           'sorted_by_playlist' as sort_type
-    FROM hw3.sorted_by_playlist.files
-    UNION ALL
-    SELECT SUM(file_size_in_bytes) as size, 
-           COUNT(1) as num_files, 
-           'sorted_by_map' as sort_type
-    FROM hw3.sorted_by_map.files
-    UNION ALL
-    SELECT SUM(file_size_in_bytes) as size, 
-           COUNT(1) as num_files, 
-           'unsorted' as sort_type
-    FROM hw3.unsorted.files
+    CREATE TABLE IF NOT EXISTS hw3.agg_matches.unsorted (
+        match_id STRING,
+        mapid STRING,
+        is_team_game BOOLEAN,
+        playlist_id STRING,
+        completion_date TIMESTAMP,
+        player_gamertag STRING,
+        player_total_kills INT,
+        player_total_deaths INT,
+        medal_count INT,
+        map_name STRING,
+        description STRING,
+        medal_id LONG,
+        medal_name STRING
+)
+USING iceberg
+PARTITIONED BY (completion_date);
+""")
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS hw3.agg_matches.date_sorted (
+        match_id STRING,
+        mapid STRING,
+        is_team_game BOOLEAN,
+        playlist_id STRING,
+        completion_date TIMESTAMP,
+        player_gamertag STRING,
+        player_total_kills INT,
+        player_total_deaths INT,
+        medal_count INT,
+        map_name STRING,
+        description STRING,
+        medal_id LONG,
+        medal_name STRING
+)
+USING iceberg
+PARTITIONED BY (completion_date);
+""")
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS hw3.agg_matches.maps_sorted (
+        match_id STRING,
+        mapid STRING,
+        is_team_game BOOLEAN,
+        playlist_id STRING,
+        completion_date TIMESTAMP,
+        player_gamertag STRING,
+        player_total_kills INT,
+        player_total_deaths INT,
+        medal_count INT,
+        map_name STRING,
+        description STRING,
+        medal_id LONG,
+        medal_name STRING
+)
+USING iceberg
+PARTITIONED BY (completion_date);
+""")
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS hw3.agg_matches.playlist_sorted (
+        match_id STRING,
+        mapid STRING,
+        is_team_game BOOLEAN,
+        playlist_id STRING,
+        completion_date TIMESTAMP,
+        player_gamertag STRING,
+        player_total_kills INT,
+        player_total_deaths INT,
+        medal_count INT,
+        map_name STRING,
+        description STRING,
+        medal_id LONG,
+        medal_name STRING
+)
+USING iceberg
+PARTITIONED BY (completion_date);
+""")
+
+df = joined_match_df \
+    .withColumn("medal_count", col("mmp.count")) \
+    .withColumn("map_name", col("maps.name")) \
+    .withColumn("medal_name", col("medals.name")) \
+    .select("m.match_id",
+        "m.mapid",
+        "m.is_team_game",
+        "m.playlist_id",
+        "m.completion_date",
+        "md.player_gamertag",
+        "md.player_total_kills",
+        "md.player_total_deaths",
+        "medal_count",
+        "map_name",
+        "maps.description",
+        "medals.medal_id",
+        "medal_name")
+
+start_df = df.repartition(4, "completion_date")
+
+first_sort_df = df.repartition(10, "completion_date") \
+             .sortWithinPartitions(col("completion_date"))
+
+maps_sort_df = df.repartition(10, "completion_date") \
+             .sortWithinPartitions(col("map_name"))
+
+playlist_sort_df = df.repartition(10, "completion_date") \
+             .sortWithinPartitions(col("playlist_id"))
+
+start_df.write.mode("overwrite").saveAsTable("hw3.agg_matches.unsorted")
+first_sort_df.write.mode("overwrite").saveAsTable("hw3.agg_matches.date_sorted")
+maps_sort_df.write.mode("overwrite").saveAsTable("hw3.agg_matches.maps_sorted")
+playlist_sort_df.write.mode("overwrite").saveAsTable("hw3.agg_matches.playlist_sorted")
+
+spark.sql("""
+SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'unsorted' 
+FROM hw3.agg_matches.unsorted.files
+UNION ALL
+SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'date_sorted' 
+FROM hw3.agg_matches.date_sorted.files
+UNION ALL
+SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'date_sorted' 
+FROM hw3.agg_matches.maps_sorted.files
+UNION ALL
+SELECT SUM(file_size_in_bytes) as size, COUNT(1) as num_files, 'date_sorted' 
+FROM hw3.agg_matches.playlist_sorted.files
 """).show()
